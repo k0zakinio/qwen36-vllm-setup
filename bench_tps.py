@@ -7,18 +7,44 @@ Code prompts see materially higher MTP acceptance (>80%) than prose (~40%)
 because repeated syntax / identifiers are what the draft head is trained to
 predict well. Use this to validate both perf and correctness after launch.
 
-  Usage: python bench_tps.py <base_url> <model>
-  e.g.   python bench_tps.py http://localhost:1234/v1 qwen3.6-27b
+  Usage: ./bench_tps.py [base_url [model]]
+
+With no args, reads PORT + SERVED_MODEL_NAME from config.env and defaults to
+`http://localhost:$PORT/v1` and `$SERVED_MODEL_NAME`.
 """
 import json
+import os
 import re
 import sys
 import time
 import urllib.request
 
-base_url = sys.argv[1].rstrip("/")
-model = sys.argv[2]
+
+def read_config_env() -> dict:
+    here = os.path.dirname(os.path.abspath(__file__))
+    cfg = os.path.join(here, "config.env")
+    out = {}
+    if os.path.isfile(cfg):
+        with open(cfg) as f:
+            for line in f:
+                m = re.match(r"\s*([A-Z_]+)\s*=\s*(.+?)\s*$", line)
+                if m:
+                    out[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return out
+
+
+if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    print(__doc__)
+    sys.exit(0)
+
+cfg = read_config_env()
+default_port = cfg.get("PORT", "1234")
+default_model = cfg.get("SERVED_MODEL_NAME", "qwen3.6-27b")
+
+base_url = (sys.argv[1] if len(sys.argv) > 1 else f"http://localhost:{default_port}/v1").rstrip("/")
+model = sys.argv[2] if len(sys.argv) > 2 else default_model
 base_root = base_url[:-3] if base_url.endswith("/v1") else base_url
+print(f"target: {base_url}  model: {model}\n")
 
 prompts = {
     "story": (
