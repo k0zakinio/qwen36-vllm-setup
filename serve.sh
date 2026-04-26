@@ -12,7 +12,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/config.env"
 
 : "${MODEL_DIR:?}" "${VENV_DIR:?}" "${LOG_DIR:?}" "${PORT:?}" "${SERVED_MODEL_NAME:?}"
-: "${MAX_MODEL_LEN:=200000}" "${MAX_NUM_SEQS:=3}" "${GPU_MEMORY_UTIL:=0.92}"
+: "${MAX_MODEL_LEN:=200000}" "${MAX_NUM_SEQS:=3}" "${GPU_MEMORY_UTIL:=0.93}"
 
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
@@ -48,6 +48,12 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export NCCL_P2P_DISABLE=1
 export VLLM_USE_FLASHINFER_SAMPLER=1
+# vLLM literally suggests these in its startup log:
+export OMP_NUM_THREADS=1                          # avoids Torch CPU thread contention
+export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 # accurate KV accounting; lets util go to 0.93 safely
+# Cheap micro-tweaks worth keeping:
+export VLLM_ENABLE_CUDAGRAPH_GC=1                 # reclaims unused captured CUDA graphs
+export NCCL_CUMEM_ENABLE=0                        # avoids a known NCCL+vLLM memory hiccup
 
 # --- Patched chat template: hardcode thinking off -------------------------
 TEMPLATE=$MODEL_DIR/chat_template.no_thinking.jinja
