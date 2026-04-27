@@ -24,6 +24,8 @@ Minimum disk: ~20 GB for weights + ~6 GB for the Python venv + CUDA wheels.
 
 ## Setup
 
+For dockerised setup, see https://github.com/tedivm/qwen36-27b-docker, otherwise to install natively follow the below steps:
+
 ```bash
 git clone <this-repo> qwen36-vllm-setup
 cd qwen36-vllm-setup
