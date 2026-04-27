@@ -1,163 +1,267 @@
 #!/usr/bin/env python3
-"""Live monitor for the vLLM server.
+"""Live monitor for the vLLM server via its Prometheus /metrics endpoint.
 
-Tails the server log and shows a rolling window of spec-decode acceptance,
-generation TPS, prefix cache hit rate, and KV usage. Stdlib-only — run with
+Polls /metrics on a fixed interval and shows per-poll spec-decode acceptance,
+prompt/generation TPS, prefix cache hit rate, KV usage, queue depth, and
+recent TTFT/ITL — all derived from monotonic counters, so prefill ticks
+appear immediately and idle gaps don't drop samples. Stdlib-only — run with
 system python3, no venv needed.
 
-  Usage: ./watch-vllm.py [LOG [WINDOW_SAMPLES]]
+  Usage: ./watch-vllm.py [--url URL] [--interval SECONDS] [--window N]
 
-  LOG             path to the server log (defaults to $LOG_DIR/vllm.log,
-                  reading LOG_DIR from config.env)
-  WINDOW_SAMPLES  rolling window size in samples (default: 12 = ~2 min)
+  --url       metrics endpoint (default: http://localhost:<PORT>/metrics,
+              reading PORT from config.env)
+  --interval  poll interval in seconds (default: 2.0)
+  --window    rolling window in samples (default: 30 = 60s @ 2s)
 """
+import argparse
 import collections
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 
-def default_log_path() -> str:
-    """Read LOG_DIR from config.env (if present) and default to <LOG_DIR>/vllm.log."""
+def default_url() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     cfg = os.path.join(here, "config.env")
-    log_dir = None
+    port = "8000"
     if os.path.isfile(cfg):
         with open(cfg) as f:
             for line in f:
-                m = re.match(r"\s*LOG_DIR\s*=\s*(.+?)\s*$", line)
+                m = re.match(r"\s*PORT\s*=\s*(.+?)\s*$", line)
                 if m:
-                    log_dir = m.group(1).strip().strip('"').strip("'")
+                    port = m.group(1).strip().strip('"').strip("'")
                     break
-    if not log_dir:
-        sys.stderr.write("No LOG_DIR in config.env — pass the log path explicitly.\n")
-        sys.exit(2)
-    return os.path.join(log_dir, "vllm.log")
+    return f"http://localhost:{port}/metrics"
 
 
-LOG = sys.argv[1] if len(sys.argv) > 1 else default_log_path()
-N = int(sys.argv[2]) if len(sys.argv) > 2 else 12
-
-SPEC_RE = re.compile(
-    r"Mean acceptance length: (?P<mean>[\d.]+).*"
-    r"Per-position acceptance rate: (?P<p1>[\d.]+), (?P<p2>[\d.]+), (?P<p3>[\d.]+).*"
-    r"Avg Draft acceptance rate: (?P<rate>[\d.]+)%"
-)
-TP_RE = re.compile(
-    r"Avg prompt throughput: (?P<prompt>[\d.]+) tokens/s.*"
-    r"Avg generation throughput: (?P<gen>[\d.]+) tokens/s.*"
-    r"Running: (?P<running>\d+) reqs.*"
-    r"GPU KV cache usage: (?P<kv>[\d.]+)%.*"
-    r"Prefix cache hit rate: (?P<pcache>[\d.]+)%"
-)
-TS_RE = re.compile(r"(\d{2}:\d{2}:\d{2})")
-
-spec_buf = collections.deque(maxlen=N)
-tp_buf = collections.deque(maxlen=N)
+METRIC_RE = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(\S+)")
+LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 
 
-def color(s, code):
+def parse_metrics(text: str) -> dict:
+    """Parse Prometheus text format into {(name, frozenset(label_pairs)): float}."""
+    out = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = METRIC_RE.match(line)
+        if not m:
+            continue
+        try:
+            val = float(m.group(3))
+        except ValueError:
+            continue
+        labels = frozenset(LABEL_RE.findall(m.group(2) or ""))
+        out[(m.group(1), labels)] = val
+    return out
+
+
+def get(metrics: dict, name: str, **filter_labels) -> float | None:
+    """Sum metric values matching `name` and (optionally) all `filter_labels`."""
+    total, found = 0.0, False
+    for (n, lbls), v in metrics.items():
+        if n != name:
+            continue
+        if filter_labels:
+            d = dict(lbls)
+            if not all(d.get(k) == v2 for k, v2 in filter_labels.items()):
+                continue
+        total += v
+        found = True
+    return total if found else None
+
+
+def snapshot(metrics: dict) -> dict:
+    """Pull just what we render."""
+    g = lambda *a, **kw: get(metrics, *a, **kw) or 0.0
+    return {
+        "_t": time.time(),
+        "prompt_tokens": g("vllm:prompt_tokens_total"),
+        "gen_tokens": g("vllm:generation_tokens_total"),
+        "drafts": g("vllm:spec_decode_num_drafts_total"),
+        "draft_tokens": g("vllm:spec_decode_num_draft_tokens_total"),
+        "accepted": g("vllm:spec_decode_num_accepted_tokens_total"),
+        "accepted_p0": g("vllm:spec_decode_num_accepted_tokens_per_pos_total", position="0"),
+        "accepted_p1": g("vllm:spec_decode_num_accepted_tokens_per_pos_total", position="1"),
+        "accepted_p2": g("vllm:spec_decode_num_accepted_tokens_per_pos_total", position="2"),
+        "prefix_queries": g("vllm:prefix_cache_queries_total"),
+        "prefix_hits": g("vllm:prefix_cache_hits_total"),
+        "preemptions": g("vllm:num_preemptions_total"),
+        "completed": g("vllm:request_success_total"),
+        "ttft_sum": g("vllm:time_to_first_token_seconds_sum"),
+        "ttft_count": g("vllm:time_to_first_token_seconds_count"),
+        "itl_sum": g("vllm:inter_token_latency_seconds_sum"),
+        "itl_count": g("vllm:inter_token_latency_seconds_count"),
+        "running": g("vllm:num_requests_running"),
+        "waiting": g("vllm:num_requests_waiting"),
+        "kv_pct": g("vllm:kv_cache_usage_perc") * 100.0,
+        "engine_awake": g("vllm:engine_sleep_state", sleep_state="awake"),
+    }
+
+
+def diff_row(a: dict, b: dict) -> dict:
+    """Per-poll deltas + instantaneous gauges from b."""
+    dt = b["_t"] - a["_t"]
+    if dt <= 0:
+        dt = 1e-9
+    d = lambda k: b[k] - a[k]
+    d_drafts = d("drafts")
+    d_dtok = d("draft_tokens")
+    d_pq = d("prefix_queries")
+    d_ttft_n = d("ttft_count")
+    d_itl_n = d("itl_count")
+    return {
+        "t": time.strftime("%H:%M:%S", time.localtime(b["_t"])),
+        "prompt_tps": d("prompt_tokens") / dt,
+        "gen_tps": d("gen_tokens") / dt,
+        "running": int(b["running"]),
+        "waiting": int(b["waiting"]),
+        "kv": b["kv_pct"],
+        "mean_accept": (d("accepted") / d_drafts + 1.0) if d_drafts > 0 else None,
+        "p0": (d("accepted_p0") / d_drafts) if d_drafts > 0 else None,
+        "p1": (d("accepted_p1") / d_drafts) if d_drafts > 0 else None,
+        "p2": (d("accepted_p2") / d_drafts) if d_drafts > 0 else None,
+        "accept_rate": (100.0 * d("accepted") / d_dtok) if d_dtok > 0 else None,
+        "prefix_hit": (100.0 * d("prefix_hits") / d_pq) if d_pq > 0 else None,
+        "ttft": (d("ttft_sum") / d_ttft_n) if d_ttft_n > 0 else None,
+        "itl": (d("itl_sum") / d_itl_n) if d_itl_n > 0 else None,
+        "preempt": int(d("preemptions")),
+        "completed": int(d("completed")),
+    }
+
+
+def color(s: str, code: str) -> str:
     return f"\x1b[{code}m{s}\x1b[0m"
 
 
-def draw():
-    shutil.get_terminal_size((120, 40))
+def fmt_ms(v: float | None, w: int = 4) -> str:
+    return f"{v*1000:>{w}.0f}ms" if v is not None else " " * (w - 2) + " --  "
+
+
+def fmt_pct(v: float | None, w: int = 4) -> str:
+    return f"{v:>{w}.0f}%" if v is not None else " " * (w - 2) + "-- "
+
+
+def draw(args, samples, last_err):
     parts = ["\x1b[H\x1b[J"]
-    hdr = f"vLLM live monitor — rolling {N} samples ({N*10}s)   now: {time.strftime('%H:%M:%S')}   Ctrl-C to quit"
+    span = args.window * args.interval
+    hdr = (f"vLLM live monitor — interval {args.interval:.1f}s, window {args.window} "
+           f"({span:.0f}s)   now: {time.strftime('%H:%M:%S')}   Ctrl-C to quit")
     parts.append(color(hdr, "1;36") + "\n")
-    parts.append(color(f"log: {LOG}", "2") + "\n\n")
+    parts.append(color(f"metrics: {args.url}", "2") + "\n")
+    if last_err:
+        parts.append(color(f"  last error: {last_err}", "31") + "\n")
+    parts.append("\n")
 
-    parts.append(color("── Spec-decode ────────────────────────────────────────────", "1") + "\n")
+    if len(samples) < 2:
+        parts.append(color("  (collecting first two samples…)\n", "2"))
+        sys.stdout.write("".join(parts))
+        sys.stdout.flush()
+        return
+
+    rows = [diff_row(samples[i - 1], samples[i]) for i in range(1, len(samples))]
+
+    parts.append(color("── Spec-decode (per poll) ─────────────────────────────────", "1") + "\n")
     parts.append(f"{'time':>8}  {'mean':>5}  {'pos1':>5}  {'pos2':>5}  {'pos3':>5}  {'accept%':>7}\n")
-    for t, mean, p1, p2, p3, rate in spec_buf:
-        mean_c = "32" if mean >= 3.2 else "33" if mean >= 2.6 else "31"
-        rate_c = "32" if rate >= 80 else "33" if rate >= 60 else "31"
-        parts.append(
-            f"{t:>8}  {color(f'{mean:>5.2f}', mean_c)}  "
-            f"{p1:>5.2f}  {p2:>5.2f}  {p3:>5.2f}  "
-            f"{color(f'{rate:>6.1f}%', rate_c)}\n"
-        )
-    if spec_buf:
-        n = len(spec_buf)
-        avg = lambda i: sum(r[i] for r in spec_buf) / n
+    spec_rows = [r for r in rows if r["mean_accept"] is not None]
+    if spec_rows:
+        for r in spec_rows[-12:]:
+            mean, rate = r["mean_accept"], r["accept_rate"] or 0.0
+            mean_c = "32" if mean >= 3.2 else "33" if mean >= 2.6 else "31"
+            rate_c = "32" if rate >= 80 else "33" if rate >= 60 else "31"
+            parts.append(
+                f"{r['t']:>8}  {color(f'{mean:>5.2f}', mean_c)}  "
+                f"{r['p0']:>5.2f}  {r['p1']:>5.2f}  {r['p2']:>5.2f}  "
+                f"{color(f'{rate:>6.1f}%', rate_c)}\n"
+            )
+        n = len(spec_rows)
+        avg = lambda k: sum(r[k] for r in spec_rows) / n
         parts.append(color(
-            f"{'avg':>8}  {avg(1):>5.2f}  {avg(2):>5.2f}  {avg(3):>5.2f}  {avg(4):>5.2f}  {avg(5):>6.1f}%\n",
+            f"{'avg':>8}  {avg('mean_accept'):>5.2f}  "
+            f"{avg('p0'):>5.2f}  {avg('p1'):>5.2f}  {avg('p2'):>5.2f}  "
+            f"{avg('accept_rate'):>6.1f}%\n",
             "1;36",
         ))
     else:
-        parts.append(color("  (waiting for spec-decode metrics…)\n", "2"))
+        parts.append(color("  (no decode steps in window)\n", "2"))
 
-    parts.append("\n" + color("── Throughput / cache ─────────────────────────────────────", "1") + "\n")
-    parts.append(f"{'time':>8}  {'gen_tps':>7}  {'prompt_tps':>10}  {'seqs':>4}  {'kv%':>5}  {'prefix%':>7}\n")
-    for t, gen, prompt, running, kv, pc in tp_buf:
-        gen_c = "32" if gen >= 60 else "33" if gen >= 20 else "31" if gen > 0 else "2"
-        kv_c = "31" if kv >= 80 else "33" if kv >= 50 else "32"
+    parts.append("\n" + color("── Throughput / cache (per poll) ──────────────────────────", "1") + "\n")
+    parts.append(
+        f"{'time':>8}  {'gen_tps':>7}  {'prompt_tps':>10}  "
+        f"{'run':>3}  {'wait':>4}  {'kv%':>5}  {'pfx':>5}  {'ttft':>6}  {'itl':>6}\n"
+    )
+    for r in rows[-12:]:
+        gen, prompt = r["gen_tps"], r["prompt_tps"]
+        gen_c = "32" if gen >= 60 else "33" if gen >= 20 else "31" if gen > 0.5 else "2"
+        prompt_c = "32" if prompt >= 1000 else "33" if prompt >= 200 else "0" if prompt > 1.0 else "2"
+        kv_c = "31" if r["kv"] >= 80 else "33" if r["kv"] >= 50 else "32"
         parts.append(
-            f"{t:>8}  {color(f'{gen:>7.1f}', gen_c)}  {prompt:>10.1f}  "
-            f"{running:>4d}  {color(f'{kv:>4.1f}%', kv_c)}  {pc:>6.1f}%\n"
+            f"{r['t']:>8}  {color(f'{gen:>7.1f}', gen_c)}  {color(f'{prompt:>10.1f}', prompt_c)}  "
+            f"{r['running']:>3d}  {r['waiting']:>4d}  "
+            f"{color(f'{r['kv']:>4.1f}%', kv_c)}  "
+            f"{fmt_pct(r['prefix_hit']):>5}  {fmt_ms(r['ttft']):>6}  {fmt_ms(r['itl']):>6}\n"
         )
-    if tp_buf:
-        gens = [r[1] for r in tp_buf]
-        active = [g for g in gens if g > 1.0]
-        peak = max(gens)
-        avg_active = sum(active) / len(active) if active else 0.0
-        parts.append(color(
-            f"\npeak gen_tps: {peak:.1f}   avg gen_tps (active windows): {avg_active:.1f}   "
-            f"samples: {len(tp_buf)}\n",
-            "1;36",
-        ))
-    else:
-        parts.append(color("  (waiting for throughput metrics…)\n", "2"))
+
+    gens = [r["gen_tps"] for r in rows]
+    prompts = [r["prompt_tps"] for r in rows]
+    active_gen = [g for g in gens if g > 1.0]
+    active_prompt = [p for p in prompts if p > 1.0]
+    peak_gen, peak_prompt = max(gens), max(prompts)
+    avg_gen = sum(active_gen) / len(active_gen) if active_gen else 0.0
+    avg_prompt = sum(active_prompt) / len(active_prompt) if active_prompt else 0.0
+    completed = sum(r["completed"] for r in rows)
+    preempt = sum(r["preempt"] for r in rows)
+    ttft_rows = [r["ttft"] for r in rows if r["ttft"] is not None]
+    itl_rows = [r["itl"] for r in rows if r["itl"] is not None]
+    ttft_avg = (sum(ttft_rows) / len(ttft_rows)) if ttft_rows else None
+    itl_avg = (sum(itl_rows) / len(itl_rows)) if itl_rows else None
+    parts.append(color(
+        f"\npeak gen_tps:    {peak_gen:>7.1f}   avg gen_tps    (active): {avg_gen:>7.1f}   "
+        f"gen-active:    {len(active_gen):>3d}/{len(rows)} polls\n"
+        f"peak prompt_tps: {peak_prompt:>7.1f}   avg prompt_tps (active): {avg_prompt:>7.1f}   "
+        f"prompt-active: {len(active_prompt):>3d}/{len(rows)} polls\n"
+        f"completed: {completed}   preemptions: {preempt}   "
+        f"ttft (window avg): {fmt_ms(ttft_avg).strip()}   itl (window avg): {fmt_ms(itl_avg).strip()}\n",
+        "1;36",
+    ))
 
     sys.stdout.write("".join(parts))
     sys.stdout.flush()
 
 
+def fetch(url: str, timeout: float) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
 def main():
-    if not os.path.isfile(LOG):
-        sys.stderr.write(f"Log file not found: {LOG}\n")
-        sys.exit(1)
-    p = subprocess.Popen(
-        ["tail", "-n", "0", "-F", LOG],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    draw()
+    p = argparse.ArgumentParser(description="Live vLLM monitor (Prometheus-based)")
+    p.add_argument("--url", default=default_url(), help="metrics endpoint URL")
+    p.add_argument("--interval", type=float, default=2.0, help="poll interval (s)")
+    p.add_argument("--window", type=int, default=30, help="rolling window (samples)")
+    args = p.parse_args()
+
+    samples = collections.deque(maxlen=args.window)
+    last_err = None
     try:
-        for line in p.stdout:
-            ts_m = TS_RE.search(line)
-            ts = ts_m.group(1) if ts_m else "??:??:??"
-            m = SPEC_RE.search(line)
-            if m:
-                spec_buf.append((
-                    ts,
-                    float(m.group("mean")),
-                    float(m.group("p1")),
-                    float(m.group("p2")),
-                    float(m.group("p3")),
-                    float(m.group("rate")),
-                ))
-                draw()
-                continue
-            m = TP_RE.search(line)
-            if m:
-                tp_buf.append((
-                    ts,
-                    float(m.group("gen")),
-                    float(m.group("prompt")),
-                    int(m.group("running")),
-                    float(m.group("kv")),
-                    float(m.group("pcache")),
-                ))
-                draw()
+        while True:
+            t0 = time.time()
+            try:
+                text = fetch(args.url, timeout=max(1.0, args.interval * 0.8))
+                samples.append(snapshot(parse_metrics(text)))
+                last_err = None
+            except (urllib.error.URLError, urllib.error.HTTPError,
+                    ConnectionError, TimeoutError, OSError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+            draw(args, samples, last_err)
+            elapsed = time.time() - t0
+            if elapsed < args.interval:
+                time.sleep(args.interval - elapsed)
     except KeyboardInterrupt:
-        pass
-    finally:
-        p.terminate()
         sys.stdout.write("\n")
 
 
